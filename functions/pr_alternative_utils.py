@@ -89,6 +89,7 @@ _OPENMM_FORCEFIELD_SINGLETON = None
 # Optional FreeSASA availability
 try:
     import freesasa  # type: ignore
+    freesasa.setVerbosity(freesasa.nowarnings) # suppress Hydrogen warnings.
     _HAS_FREESASA = True
 except Exception:
     freesasa = None  # type: ignore
