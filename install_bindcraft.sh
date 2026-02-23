@@ -1,5 +1,5 @@
 #!/bin/bash
-################## BindCraft installation script
+################## FreeBindCraft installation script
 ################## specify conda/mamba folder, and installation folder for git repositories, and whether to use mamba or $pkg_manager
 # Default value for pkg_manager
 pkg_manager='conda'
@@ -75,16 +75,17 @@ if [ "$fix_channels" = true ]; then
     echo -e "Channel configuration applied\n"
 fi
 
-### BindCraft install begin, create base environment
-echo -e "Installing BindCraft environment\n"
-$pkg_manager create --name BindCraft python=3.10 -y || { echo -e "Error: Failed to create BindCraft conda environment"; exit 1; }
-conda env list | grep -w 'BindCraft' >/dev/null 2>&1 || { echo -e "Error: Conda environment 'BindCraft' does not exist after creation."; exit 1; }
+### FreeBindCraft install begin, create base environment
+echo -e "Installing FreeBindCraft environment\n"
+$pkg_manager create --name FreeBindCraft python=3.10 -y || { echo -e "Error: Failed to create FreeBindCraft conda environment"; exit 1; }
+conda env list | grep -w 'FreeBindCraft' >/dev/null 2>&1 || { echo -e "Error: Conda environment 'FreeBindCraft' does not exist after creation."; exit 1; }
 
-# Load newly created BindCraft environment
-echo -e "Loading BindCraft environment\n"
-source ${CONDA_BASE}/bin/activate ${CONDA_BASE}/envs/BindCraft || { echo -e "Error: Failed to activate the BindCraft environment."; exit 1; }
-[ "$CONDA_DEFAULT_ENV" = "BindCraft" ] || { echo -e "Error: The BindCraft environment is not active."; exit 1; }
-echo -e "BindCraft environment activated at ${CONDA_BASE}/envs/BindCraft"
+# Load newly created FreeBindCraft environment
+echo -e "Loading FreeBindCraft environment\n"
+eval "$(conda shell.bash hook)"
+conda activate FreeBindCraft || { echo -e "Error: Failed to activate the FreeBindCraft environment."; exit 1; }
+[ "$CONDA_DEFAULT_ENV" = "FreeBindCraft" ] || { echo -e "Error: The FreeBindCraft environment is not active."; exit 1; }
+echo -e "FreeBindCraft environment activated"
 
 # install required conda packages
 echo -e "Installing conda requirements\n"
@@ -207,7 +208,7 @@ fi
 
 # finish
 conda deactivate
-echo -e "BindCraft environment set up\n"
+echo -e "FreeBindCraft environment set up\n"
 
 ############################################################################################################
 ############################################################################################################
@@ -218,8 +219,8 @@ echo -e "$pkg_manager cleaned up\n"
 
 ################## finish script
 t=$SECONDS 
-echo -e "Successfully finished BindCraft installation!\n"
-echo -e "Activate environment using command: \"$pkg_manager activate BindCraft\""
+echo -e "Successfully finished FreeBindCraft installation!\n"
+echo -e "Activate environment using command: \"$pkg_manager activate FreeBindCraft\""
 echo -e "\n"
 echo -e "Installation took $(($t / 3600)) hours, $((($t / 60) % 60)) minutes and $(($t % 60)) seconds."
 echo -e "\n"
