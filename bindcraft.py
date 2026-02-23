@@ -67,7 +67,8 @@ ensure_binaries_executable()
 ######################################
 ### parse input paths and interactive mode
 parser = argparse.ArgumentParser(description='Script to run BindCraft binder design.')
-
+parser.add_argument("--filtering_pdb", type=str, default=None, help="Full PDB for validation")
+parser.add_argument("--filtering_chains", type=str, default=None, help="Chains to use from the filtering PDB")
 parser.add_argument('--settings', '-s', type=str, required=False,
                     help='Path to the basic settings.json file. If omitted in a TTY, interactive mode is used.')
 parser.add_argument('--filters', '-f', type=str, default='./settings_filters/default_filters.json',
@@ -309,14 +310,17 @@ def _prompt_interactive_and_prepare_args(args):
 
     # Prepare target settings JSON
     target_settings = {
-        "design_path": output_dir,
-        "binder_name": project_name,
-        "starting_pdb": pdb_path,
-        "chains": chains,
-        "target_hotspot_residues": hotspots,
-        "lengths": lengths,
-        "number_of_final_designs": num_designs
-    }
+            "design_path": output_dir,
+            "binder_name": project_name,
+            "starting_pdb": pdb_path,
+            "chains": chains,
+            "target_hotspot_residues": hotspots,
+            "lengths": lengths,
+            "number_of_final_designs": num_designs,
+            # Get from args if provided via CLI, otherwise null
+            "filtering_pdb": args.filtering_pdb if hasattr(args, 'filtering_pdb') else None,
+            "filtering_chains": args.filtering_chains if hasattr(args, 'filtering_chains') else None
+        }
 
     timestamp = time.strftime('%Y%m%d_%H%M%S')
     settings_filename = f"interactive_{project_name}_{timestamp}.json"
@@ -625,13 +629,16 @@ while True:
                     ### Compile prediction models once for faster prediction of MPNN sequences
                     clear_mem()
                     # compile complex prediction model
+                    validation_pdb = target_settings.get("filtering_pdb") if target_settings.get("filtering_pdb") else target_settings["starting_pdb"]
+                    validation_chains = target_settings.get("filtering_chains") if target_settings.get("filtering_chains") else target_settings["chains"]
+                    
                     complex_prediction_model = mk_afdesign_model(protocol="binder", num_recycles=advanced_settings["num_recycles_validation"], data_dir=advanced_settings["af_params_dir"], 
                                                                 use_multimer=multimer_validation, use_initial_guess=advanced_settings["predict_initial_guess"], use_initial_atom_pos=advanced_settings["predict_bigbang"])
                     if advanced_settings["predict_initial_guess"] or advanced_settings["predict_bigbang"]:
                         complex_prediction_model.prep_inputs(pdb_filename=trajectory_pdb, chain='A', binder_chain='B', binder_len=length, use_binder_template=True, rm_target_seq=advanced_settings["rm_template_seq_predict"],
                                                             rm_target_sc=advanced_settings["rm_template_sc_predict"], rm_template_ic=True)
                     else:
-                        complex_prediction_model.prep_inputs(pdb_filename=target_settings["starting_pdb"], chain=target_settings["chains"], binder_len=length, rm_target_seq=advanced_settings["rm_template_seq_predict"],
+                        complex_prediction_model.prep_inputs(pdb_filename=validation_pdb, chain=validation_chains, binder_len=length, rm_target_seq=advanced_settings["rm_template_seq_predict"],
                                                             rm_target_sc=advanced_settings["rm_template_sc_predict"])
 
                     # compile binder monomer prediction model
@@ -659,7 +666,7 @@ while True:
                         ### Predict mpnn redesigned binder complex using masked templates
                         mpnn_complex_statistics, pass_af2_filters, early_filter_details = predict_binder_complex(complex_prediction_model,
                                                                                         mpnn_sequence['seq'], mpnn_design_name,
-                                                                                        target_settings["starting_pdb"], target_settings["chains"],
+                                                                                        validation_pdb, validation_chains,
                                                                                         length, trajectory_pdb, prediction_models, advanced_settings,
                                                                                         filters, design_paths, failure_csv, use_pyrosetta=use_pyrosetta)
 
@@ -709,12 +716,12 @@ while True:
                                 # secondary structure content of starting trajectory binder
                                 mpnn_alpha, mpnn_beta, mpnn_loops, mpnn_alpha_interface, mpnn_beta_interface, mpnn_loops_interface, mpnn_i_plddt, mpnn_ss_plddt = calc_ss_percentage(mpnn_design_pdb, advanced_settings, binder_chain)
                                 
-                                # unaligned RMSD calculate to determine if binder is in the designed binding site
+                                # unaligned RMSD: compare the binder in the full complex vs the binder in the original design trajectory
                                 rmsd_site = unaligned_rmsd(trajectory_pdb, mpnn_design_pdb, binder_chain, binder_chain, use_pyrosetta=use_pyrosetta)
 
-                                # calculate RMSD of target compared to input PDB
-                                target_rmsd = target_pdb_rmsd(mpnn_design_pdb, target_settings["starting_pdb"], target_settings["chains"])
-
+                                # target RMSD: compare the target in the full complex vs the FULL validation PDB (not the patch!)
+                                target_rmsd = target_pdb_rmsd(mpnn_design_pdb, validation_pdb, validation_chains)
+                                
                                 # add the additional statistics to the mpnn_complex_statistics dictionary
                                 mpnn_complex_statistics[model_num+1].update({
                                     'i_pLDDT': mpnn_i_plddt,
