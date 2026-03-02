@@ -451,6 +451,12 @@ del temp_failure_df_for_cols # Free memory
 rejected_stats_columns = ['Design', 'Sequence'] + filter_column_names_for_rejected_log
 rejected_mpnn_full_stats_csv = os.path.join(target_settings["design_path"], 'rejected_mpnn_full_stats.csv')
 create_dataframe(rejected_mpnn_full_stats_csv, rejected_stats_columns)
+
+### Define and initialize all_mpnn_full_stats.csv (actual metric values for every MPNN sequence)
+all_mpnn_labels = design_labels + ['Passed_AF2_Filters', 'Passed_All_Filters']
+all_mpnn_full_stats_csv = os.path.join(target_settings["design_path"], 'all_mpnn_full_stats.csv')
+create_dataframe(all_mpnn_full_stats_csv, all_mpnn_labels)
+migrate_csv_columns(all_mpnn_full_stats_csv, all_mpnn_labels)
 ####################################
 ####################################
 ####################################
@@ -774,13 +780,22 @@ while True:
                 # save fasta sequence
                 if advanced_settings["save_mpnn_fasta"] is True:
                     save_fasta(mpnn_design_name, mpnn_sequence['seq'], design_paths)
-                
+
+                # Define statistics_labels and model_numbers here so they're available
+                # for both early-failure partial rows and full-success rows
+                model_numbers = range(1, 6)
+                statistics_labels = ['pLDDT', 'pTM', 'i_pTM', 'pAE', 'i_pAE', 'ipSAE', 'i_pLDDT', 'ss_pLDDT', 'Unrelaxed_Clashes', 'Relaxed_Clashes', 'Binder_Energy_Score', 'Surface_Hydrophobicity',
+                                    'ShapeComplementarity', 'PackStat', 'dG', 'dSASA', 'dG/dSASA', 'Interface_SASA_%', 'Interface_Hydrophobicity', 'n_InterfaceResidues', 'n_InterfaceHbonds', 'InterfaceHbondsPercentage',
+                                    'n_InterfaceUnsatHbonds', 'InterfaceUnsatHbondsPercentage', 'Interface_Helix%', 'Interface_BetaSheet%', 'Interface_Loop%', 'Binder_Helix%',
+                                    'Binder_BetaSheet%', 'Binder_Loop%', 'InterfaceAAs', 'Hotspot_RMSD', 'Target_RMSD']
+
                 ### Predict mpnn redesigned binder complex using masked templates
                 mpnn_complex_statistics, pass_af2_filters, early_filter_details = predict_binder_complex(complex_prediction_model,
                                                                                 mpnn_sequence['seq'], mpnn_design_name,
                                                                                 validation_pdb, validation_chains,
                                                                                 length, trajectory_pdb, prediction_models, advanced_settings,
-                                                                                filters, design_paths, failure_csv, use_pyrosetta=use_pyrosetta)
+                                                                                filters, design_paths, failure_csv, use_pyrosetta=use_pyrosetta,
+                                                                                keep_all_mpnn_data=advanced_settings.get('keep_all_mpnn_data', False))
 
                 # if AF2 filters are not passed then skip the scoring but log the failure
                 if not pass_af2_filters:
@@ -798,6 +813,24 @@ while True:
                             _parts_list.append(f"{_fk} {_fmt(_achieved)} ({_fmt(_threshold)})")
                         print("  Failed: " + "; ".join(_parts_list))
                     # ---------------------------------------------------------------------------------
+
+                    # Log to all_mpnn_full_stats.csv with actual values (partial — only AF2 metrics available)
+                    _all_mpnn_row_early = [
+                        mpnn_design_name, advanced_settings["design_algorithm"], length, seed, helicity_value,
+                        target_settings["target_hotspot_residues"], mpnn_sequence['seq'], None,  # InterfaceResidues unknown
+                        mpnn_score, mpnn_seqid
+                    ]
+                    for _lbl in statistics_labels:
+                        _all_mpnn_row_early.append(None)  # no average (partial model run)
+                        for _m in model_numbers:
+                            _all_mpnn_row_early.append(mpnn_complex_statistics.get(_m, {}).get(_lbl, None))
+                    for _lbl in ['pLDDT', 'pTM', 'pAE', 'Binder_RMSD']:  # binder-alone stats (not computed)
+                        _all_mpnn_row_early.append(None)
+                        for _m in model_numbers:
+                            _all_mpnn_row_early.append(None)
+                    _elapsed_early = f"{'%d hours, %d minutes, %d seconds' % (int((time.time()-mpnn_time) // 3600), int(((time.time()-mpnn_time) % 3600) // 60), int((time.time()-mpnn_time) % 60))}"
+                    _all_mpnn_row_early.extend([_elapsed_early, None, settings_file, filters_file, advanced_file, False, False])
+                    insert_data(all_mpnn_full_stats_csv, _all_mpnn_row_early)
 
                     # Log to rejected_mpnn_full_stats.csv for early AF2 failures
                     rejected_data_list_for_csv = [mpnn_design_name, mpnn_sequence['seq']]
@@ -879,7 +912,7 @@ while True:
                         })
 
                         # save space by removing unrelaxed predicted mpnn complex pdb?
-                        if advanced_settings["remove_unrelaxed_complex"]:
+                        if advanced_settings["remove_unrelaxed_complex"] and not advanced_settings.get("keep_all_mpnn_data", False):
                             os.remove(mpnn_design_pdb)
 
                 # calculate complex averages
@@ -903,7 +936,7 @@ while True:
                         })
 
                     # save space by removing binder monomer models?
-                    if advanced_settings["remove_binder_monomer"]:
+                    if advanced_settings["remove_binder_monomer"] and not advanced_settings.get("keep_all_mpnn_data", False):
                         os.remove(mpnn_binder_pdb)
 
                 # calculate binder averages
@@ -915,14 +948,6 @@ while True:
                 # measure time to generate design
                 mpnn_end_time = time.time() - mpnn_time
                 elapsed_mpnn_text = f"{'%d hours, %d minutes, %d seconds' % (int(mpnn_end_time // 3600), int((mpnn_end_time % 3600) // 60), int(mpnn_end_time % 60))}"
-
-
-                # Insert statistics about MPNN design into CSV, will return None if corresponding model does note exist
-                model_numbers = range(1, 6)
-                statistics_labels = ['pLDDT', 'pTM', 'i_pTM', 'pAE', 'i_pAE', 'ipSAE', 'i_pLDDT', 'ss_pLDDT', 'Unrelaxed_Clashes', 'Relaxed_Clashes', 'Binder_Energy_Score', 'Surface_Hydrophobicity',
-                                    'ShapeComplementarity', 'PackStat', 'dG', 'dSASA', 'dG/dSASA', 'Interface_SASA_%', 'Interface_Hydrophobicity', 'n_InterfaceResidues', 'n_InterfaceHbonds', 'InterfaceHbondsPercentage',
-                                    'n_InterfaceUnsatHbonds', 'InterfaceUnsatHbondsPercentage', 'Interface_Helix%', 'Interface_BetaSheet%', 'Interface_Loop%', 'Binder_Helix%',
-                                    'Binder_BetaSheet%', 'Binder_Loop%', 'InterfaceAAs', 'Hotspot_RMSD', 'Target_RMSD']
 
                 # Initialize mpnn_data with the non-statistical data
                 mpnn_data = [mpnn_design_name, advanced_settings["design_algorithm"], length, seed, helicity_value, target_settings["target_hotspot_residues"], mpnn_sequence['seq'], mpnn_interface_residues, mpnn_score, mpnn_seqid]
@@ -945,7 +970,6 @@ while True:
                 # insert data into csv
                 insert_data(mpnn_csv, mpnn_data)
 
-                # find best model number by pLDDT
                 plddt_values = {i: mpnn_data[i] for i in range(11, 15) if mpnn_data[i] is not None}
 
                 # Find the key with the highest value
@@ -957,6 +981,9 @@ while True:
 
                 # run design data against filter thresholds
                 filter_conditions = check_filters(mpnn_data, design_labels, filters)
+                _all_mpnn_passed_filters = (filter_conditions == True)
+                insert_data(all_mpnn_full_stats_csv, mpnn_data + [True, _all_mpnn_passed_filters])
+
                 if filter_conditions == True:
                     print(mpnn_design_name+" passed all filters")
                     accepted_mpnn += 1

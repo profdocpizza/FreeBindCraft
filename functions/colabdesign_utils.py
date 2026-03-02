@@ -269,7 +269,7 @@ def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residu
     return af_model
 
 # run prediction for binder with masked template target
-def predict_binder_complex(prediction_model, binder_sequence, mpnn_design_name, target_pdb, chain, length, trajectory_pdb, prediction_models, advanced_settings, filters, design_paths, failure_csv, seed=None, use_pyrosetta=True):
+def predict_binder_complex(prediction_model, binder_sequence, mpnn_design_name, target_pdb, chain, length, trajectory_pdb, prediction_models, advanced_settings, filters, design_paths, failure_csv, seed=None, use_pyrosetta=True, keep_all_mpnn_data=False):
     prediction_stats = {}
 
     # clean sequence
@@ -346,7 +346,7 @@ def predict_binder_complex(prediction_model, binder_sequence, mpnn_design_name, 
             mpnn_relaxed = os.path.join(design_paths["MPNN/Relaxed"], f"{mpnn_design_name}_model{model_num+1}.pdb")
             pr_relax(complex_pdb, mpnn_relaxed, use_pyrosetta=use_pyrosetta)
         else:
-            if os.path.exists(complex_pdb):
+            if os.path.exists(complex_pdb) and not keep_all_mpnn_data:
                 os.remove(complex_pdb)
 
     return prediction_stats, pass_af2_filters, filter_failures

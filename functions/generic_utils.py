@@ -270,6 +270,10 @@ def perform_advanced_settings_check(advanced_settings, bindcraft_folder):
     if "save_design_animations" not in advanced_settings:
         advanced_settings["save_design_animations"] = True
 
+    # Ensure keep_all_mpnn_data default
+    if "keep_all_mpnn_data" not in advanced_settings:
+        advanced_settings["keep_all_mpnn_data"] = False
+
     # Ensure required executables are present and executable (chmod +x if needed)
     _ensure_required_executables(advanced_settings, bindcraft_folder)
 
