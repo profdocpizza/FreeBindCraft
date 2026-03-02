@@ -285,7 +285,7 @@ def predict_binder_complex(prediction_model, binder_sequence, mpnn_design_name, 
     for model_num in prediction_models:
         # check to make sure prediction does not exist already
         complex_pdb = os.path.join(design_paths["MPNN"], f"{mpnn_design_name}_model{model_num+1}.pdb")
-        if not os.path.exists(complex_pdb):
+        if not os.path.exists(complex_pdb) or keep_all_mpnn_data:
             # predict model
             prediction_model.predict(seq=binder_sequence, models=[model_num], num_recycles=advanced_settings["num_recycles_validation"], verbose=False)
             prediction_model.save_pdb(complex_pdb)
@@ -352,7 +352,7 @@ def predict_binder_complex(prediction_model, binder_sequence, mpnn_design_name, 
     return prediction_stats, pass_af2_filters, filter_failures
 
 # run prediction for binder alone
-def predict_binder_alone(prediction_model, binder_sequence, mpnn_design_name, length, trajectory_pdb, binder_chain, prediction_models, advanced_settings, design_paths, seed=None, use_pyrosetta=True):
+def predict_binder_alone(prediction_model, binder_sequence, mpnn_design_name, length, trajectory_pdb, binder_chain, prediction_models, advanced_settings, design_paths, seed=None, use_pyrosetta=True, keep_all_mpnn_data=False):
     binder_stats = {}
 
     # prepare sequence for prediction
@@ -365,7 +365,7 @@ def predict_binder_alone(prediction_model, binder_sequence, mpnn_design_name, le
     for model_num in prediction_models:
         # check to make sure prediction does not exist already
         binder_alone_pdb = os.path.join(design_paths["MPNN/Binder"], f"{mpnn_design_name}_model{model_num+1}.pdb")
-        if not os.path.exists(binder_alone_pdb):
+        if not os.path.exists(binder_alone_pdb) or keep_all_mpnn_data:
             # predict model
             prediction_model.predict(models=[model_num], num_recycles=advanced_settings["num_recycles_validation"], verbose=False)
             prediction_model.save_pdb(binder_alone_pdb)

@@ -529,11 +529,16 @@ if args.steps == 'filtering':
         except Exception as _e:
             print(f"Warning: could not read existing MPNN designs from {mpnn_csv}: {_e}")
 
-    _unprocessed = [p for p in _all_relaxed
-                    if os.path.splitext(os.path.basename(p))[0] not in _processed_trajectories]
-    print(f"Filtering mode: {len(_all_relaxed)} relaxed trajectories found, "
-          f"{len(_processed_trajectories)} already have MPNN designs, "
-          f"{len(_unprocessed)} to process.")
+    if advanced_settings.get('keep_all_mpnn_data', False) and _processed_trajectories:
+        print(f"Warning: keep_all_mpnn_data is enabled - reprocessing all {len(_all_relaxed)} trajectories "
+              f"({len(_processed_trajectories)} will overwrite existing MPNN designs).")
+        _unprocessed = _all_relaxed
+    else:
+        _unprocessed = [p for p in _all_relaxed
+                        if os.path.splitext(os.path.basename(p))[0] not in _processed_trajectories]
+        print(f"Filtering mode: {len(_all_relaxed)} relaxed trajectories found, "
+              f"{len(_processed_trajectories)} already have MPNN designs, "
+              f"{len(_unprocessed)} to process.")
     _filtering_iter = iter(_unprocessed)
 
 ### start design loop
@@ -921,7 +926,7 @@ while True:
                 ### Predict binder alone in single sequence mode
                 binder_statistics = predict_binder_alone(binder_prediction_model, mpnn_sequence['seq'], mpnn_design_name, length,
                                                         trajectory_pdb, binder_chain, prediction_models, advanced_settings, design_paths, 
-                                                        use_pyrosetta=use_pyrosetta)
+                                                        use_pyrosetta=use_pyrosetta, keep_all_mpnn_data=advanced_settings.get('keep_all_mpnn_data', False))
 
                 # extract RMSDs of binder to the original trajectory
                 for model_num in prediction_models:
@@ -1013,6 +1018,15 @@ while True:
 
                 else:
                     print(f"Unmet filter conditions for {mpnn_design_name}")
+                    _filt_dict = dict(zip(design_labels, mpnn_data))
+                    _failed_parts = []
+                    for _fc in filter_conditions:
+                        _val = _filt_dict.get(_fc)
+                        _thr = filters.get(_fc, {}).get("threshold")
+                        if _val is not None and _thr is not None:
+                            _failed_parts.append(f"{_fc} {round(float(_val), 2)} ({_thr})")
+                    if _failed_parts:
+                        print(f"  Failed: {'; '.join(_failed_parts)}")
                     failure_df = pd.read_csv(failure_csv)
                     special_prefixes = ('Average_', '1_', '2_', '3_', '4_', '5_')
                     incremented_columns = set()
