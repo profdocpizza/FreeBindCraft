@@ -274,6 +274,10 @@ def perform_advanced_settings_check(advanced_settings, bindcraft_folder):
     if "keep_all_mpnn_data" not in advanced_settings:
         advanced_settings["keep_all_mpnn_data"] = False
 
+    # Ensure remove_intra_chain_template default
+    if "remove_intra_chain_template" not in advanced_settings:
+        advanced_settings["remove_intra_chain_template"] = True
+
     # Ensure required executables are present and executable (chmod +x if needed)
     _ensure_required_executables(advanced_settings, bindcraft_folder)
 

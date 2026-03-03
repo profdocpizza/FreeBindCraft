@@ -759,7 +759,7 @@ while True:
                                                         use_multimer=multimer_validation, use_initial_guess=advanced_settings["predict_initial_guess"], use_initial_atom_pos=advanced_settings["predict_bigbang"])
             if advanced_settings["predict_initial_guess"] or advanced_settings["predict_bigbang"]:
                 complex_prediction_model.prep_inputs(pdb_filename=trajectory_pdb, chain='A', binder_chain='B', binder_len=length, use_binder_template=True, rm_target_seq=advanced_settings["rm_template_seq_predict"],
-                                                    rm_target_sc=advanced_settings["rm_template_sc_predict"], rm_template_ic=True)
+                                                    rm_target_sc=advanced_settings["rm_template_sc_predict"], rm_template_ic=advanced_settings["remove_intra_chain_template"])
             else:
                 complex_prediction_model.prep_inputs(pdb_filename=validation_pdb, chain=validation_chains, binder_len=length, rm_target_seq=advanced_settings["rm_template_seq_predict"],
                                                     rm_target_sc=advanced_settings["rm_template_sc_predict"])
