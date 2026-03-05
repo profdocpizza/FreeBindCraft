@@ -92,12 +92,42 @@ parser.add_argument('--interactive', action='store_true',
 parser.add_argument('--rank-by', type=str, default='i_pTM',
                     choices=['i_pTM', 'ipSAE'],
                     help='Metric to rank final designs by (default: i_pTM)')
-parser.add_argument('--steps', type=str, default='all',
-                    choices=['all', 'filtering'],
-                    help='Steps to run: "all" runs hallucination + MPNN/filtering (default), '
-                         '"filtering" skips hallucination and processes existing Trajectory/Relaxed PDBs through MPNN and folding')
+parser.add_argument('--steps', nargs='+', default=None,
+                    choices=['hallucination', 'mpnn', 'filtering', 'all'],
+                    help='Steps to run in order. Default is: hallucination mpnn filtering. '
+                         'Examples: --steps hallucination, --steps mpnn, --steps filtering, '
+                         '--steps hallucination mpnn, --steps mpnn filtering')
+parser.add_argument('--reuse', action='store_true',
+                    help='Reuse existing outputs and run only missing work for selected step(s)')
 
 args = parser.parse_args()
+
+def _normalize_steps(step_args):
+    if not step_args:
+        return ['hallucination', 'mpnn', 'filtering']
+
+    requested = []
+    for step in step_args:
+        if step == 'all':
+            requested.extend(['hallucination', 'mpnn', 'filtering'])
+        else:
+            requested.append(step)
+
+    selected = set(requested)
+    ordered = [s for s in ['hallucination', 'mpnn', 'filtering'] if s in selected]
+    if not ordered:
+        print("Error: no valid steps selected.")
+        sys.exit(1)
+    return ordered
+
+selected_steps = _normalize_steps(args.steps)
+run_hallucination = 'hallucination' in selected_steps
+run_mpnn = 'mpnn' in selected_steps
+run_filtering = 'filtering' in selected_steps
+
+if run_hallucination and run_filtering and not run_mpnn:
+    print("Error: filtering requires MPNN sequences; include the mpnn step when hallucinating new trajectories.")
+    sys.exit(1)
 
 def _isatty_stdin():
     try:
@@ -409,6 +439,14 @@ if args.no_plots:
 if args.no_animations:
     advanced_settings["save_design_animations"] = False
 
+if run_mpnn:
+    # MPNN stage must always retain sequence outputs and all generated data for resumable downstream filtering.
+    advanced_settings["save_mpnn_fasta"] = True
+    advanced_settings["keep_all_mpnn_data"] = True
+elif run_filtering and not args.reuse:
+    # In non-reuse mode, force regeneration/overwrite of filtering outputs.
+    advanced_settings["keep_all_mpnn_data"] = True
+
 ### generate directories, design path names can be found within the function
 design_paths = generate_directories(target_settings["design_path"])
 
@@ -484,6 +522,11 @@ ensure_binaries_executable(use_pyrosetta=use_pyrosetta)
 print(f"Running binder design for target {settings_file}")
 print(f"Design settings used: {advanced_file}")
 print(f"Filtering designs based on {filters_file}")
+print(f"Selected steps: {' '.join(selected_steps)}")
+if args.reuse:
+    print("Reuse mode enabled: existing outputs will be kept and completed items will be skipped.")
+else:
+    print("Warning: --reuse not set. Existing outputs may be overwritten.")
 
 ####################################
 # initialise counters
@@ -513,60 +556,139 @@ def _extract_binder_sequence(pdb_path, chain_id):
         print(f"Warning: could not extract sequence from {pdb_path} chain {chain_id}: {e}")
         return ''
 
-### Filtering mode: build iterator over existing Trajectory/Relaxed PDBs
-if args.steps == 'filtering':
-    _relaxed_dir = design_paths["Trajectory/Relaxed"]
-    _all_relaxed = sorted(glob.glob(os.path.join(_relaxed_dir, "*.pdb")))
+def _read_fasta_sequences(fasta_path):
+    sequences = []
+    if not os.path.exists(fasta_path):
+        return sequences
+    header = None
+    seq_parts = []
+    with open(fasta_path, 'r') as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith('>'):
+                if header and seq_parts:
+                    sequences.append((header, ''.join(seq_parts)))
+                header = line[1:].strip()
+                seq_parts = []
+            else:
+                seq_parts.append(line)
+    if header and seq_parts:
+        sequences.append((header, ''.join(seq_parts)))
+    return sequences
 
-    # Identify trajectories that already have MPNN runs so we can skip them
-    _processed_trajectories = set()
-    if os.path.exists(mpnn_csv) and os.path.getsize(mpnn_csv) > 0:
-        try:
-            _df_done = pd.read_csv(mpnn_csv, usecols=['Design'])
-            for _d in _df_done['Design'].dropna():
-                _traj = re.sub(r'_mpnn\d+$', '', str(_d))
-                _processed_trajectories.add(_traj)
-        except Exception as _e:
-            print(f"Warning: could not read existing MPNN designs from {mpnn_csv}: {_e}")
+def _load_sequences_for_design(design_name, design_paths):
+    sequences_path = os.path.join(design_paths["MPNN/Sequences"], f"{design_name}.fasta")
+    sequence_entries = []
+    for idx, (header, sequence) in enumerate(_read_fasta_sequences(sequences_path), start=1):
+        entry_name = header if header else f"{design_name}_mpnn{idx}"
+        sequence_entries.append({'design_name': entry_name, 'seq': sequence, 'score': None, 'seqid': None})
 
-    if advanced_settings.get('keep_all_mpnn_data', False) and _processed_trajectories:
-        print(f"Warning: keep_all_mpnn_data is enabled - reprocessing all {len(_all_relaxed)} trajectories "
-              f"({len(_processed_trajectories)} will overwrite existing MPNN designs).")
-        _unprocessed = _all_relaxed
-    else:
-        _unprocessed = [p for p in _all_relaxed
-                        if os.path.splitext(os.path.basename(p))[0] not in _processed_trajectories]
-        print(f"Filtering mode: {len(_all_relaxed)} relaxed trajectories found, "
-              f"{len(_processed_trajectories)} already have MPNN designs, "
-              f"{len(_unprocessed)} to process.")
-    _filtering_iter = iter(_unprocessed)
+    if sequence_entries:
+        return sequence_entries
+
+    # Backward compatibility with older per-sequence FASTA files
+    legacy_fastas = sorted(glob.glob(os.path.join(design_paths["MPNN/Sequences"], f"{design_name}_mpnn*.fasta")))
+    for fasta_file in legacy_fastas:
+        parsed = _read_fasta_sequences(fasta_file)
+        if not parsed:
+            continue
+        header, sequence = parsed[0]
+        entry_name = header if header else os.path.splitext(os.path.basename(fasta_file))[0]
+        sequence_entries.append({'design_name': entry_name, 'seq': sequence, 'score': None, 'seqid': None})
+    return sequence_entries
+
+def _has_saved_sequences_for_design(design_name, design_paths):
+    sequences_path = os.path.join(design_paths["MPNN/Sequences"], f"{design_name}.fasta")
+    if os.path.exists(sequences_path):
+        return True
+    legacy_fastas = glob.glob(os.path.join(design_paths["MPNN/Sequences"], f"{design_name}_mpnn*.fasta"))
+    return len(legacy_fastas) > 0
+
+def _save_sequences_for_design(design_name, sequence_entries, design_paths):
+    sequences_path = os.path.join(design_paths["MPNN/Sequences"], f"{design_name}.fasta")
+    with open(sequences_path, "w") as fasta:
+        for idx, sequence_entry in enumerate(sequence_entries, start=1):
+            entry_name = sequence_entry.get('design_name') or f"{design_name}_mpnn{idx}"
+            sequence = sequence_entry['seq']
+            fasta.write(f">{entry_name}\n{sequence}\n")
+
+def _collect_existing_trajectory_records(design_paths):
+    relaxed_dir = design_paths["Trajectory/Relaxed"]
+    trajectory_dir = design_paths["Trajectory"]
+    relaxed_names = {os.path.splitext(os.path.basename(p))[0]: p for p in glob.glob(os.path.join(relaxed_dir, "*.pdb"))}
+    trajectory_names = {os.path.splitext(os.path.basename(p))[0]: p for p in glob.glob(os.path.join(trajectory_dir, "*.pdb"))}
+
+    all_names = sorted(set(relaxed_names) | set(trajectory_names))
+    records = []
+    for design_name in all_names:
+        trajectory_relaxed = relaxed_names.get(design_name)
+        trajectory_pdb = trajectory_names.get(design_name) or trajectory_relaxed
+        if trajectory_pdb:
+            records.append((design_name, trajectory_pdb, trajectory_relaxed))
+    return records
+
+def _load_processed_design_names(csv_path):
+    processed = set()
+    if not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0:
+        return processed
+    try:
+        df = pd.read_csv(csv_path, usecols=['Design'])
+        for design in df['Design'].dropna().astype(str):
+            processed.add(design)
+    except Exception as exc:
+        print(f"Warning: could not read processed designs from {csv_path}: {exc}")
+    return processed
+
+### MPNN/filtering-only mode: build iterator over existing trajectories
+if not run_hallucination:
+    _existing_records = _collect_existing_trajectory_records(design_paths)
+    _to_process_records = []
+    for _design_name, _trajectory_pdb, _trajectory_relaxed in _existing_records:
+        _has_fasta = _has_saved_sequences_for_design(_design_name, design_paths)
+        if args.reuse and run_mpnn and not run_filtering and _has_fasta:
+            continue
+        if run_filtering and (not run_mpnn) and (not _has_fasta):
+            _expected_path = os.path.join(design_paths["MPNN/Sequences"], f"{_design_name}.fasta")
+            print(f"Skipping {_design_name}: missing required {_expected_path} for filtering-only step")
+            continue
+        _to_process_records.append((_design_name, _trajectory_pdb, _trajectory_relaxed))
+
+    print(f"Found {len(_existing_records)} existing trajectories, processing {len(_to_process_records)}")
+    _filtering_iter = iter(_to_process_records)
+
+_processed_filtering_designs = set()
+if args.reuse and run_filtering:
+    _processed_filtering_designs.update(_load_processed_design_names(mpnn_csv))
+    _processed_filtering_designs.update(_load_processed_design_names(all_mpnn_full_stats_csv))
 
 ### start design loop
 while True:
     ### check if we have the target number of binders
-    # Map CLI metric name to CSV column name (e.g., 'i_pTM' -> 'Average_i_pTM')
-    rank_by_column = f"Average_{args.rank_by}"
-    final_designs_reached = check_accepted_designs(design_paths, mpnn_csv, final_labels, final_csv, advanced_settings, target_settings, design_labels, rank_by=rank_by_column)
+    if run_filtering:
+        # Map CLI metric name to CSV column name (e.g., 'i_pTM' -> 'Average_i_pTM')
+        rank_by_column = f"Average_{args.rank_by}"
+        final_designs_reached = check_accepted_designs(design_paths, mpnn_csv, final_labels, final_csv, advanced_settings, target_settings, design_labels, rank_by=rank_by_column)
 
-    if final_designs_reached:
-        # stop design loop execution
-        break
+        if final_designs_reached:
+            # stop design loop execution
+            break
 
     # Per-iteration flags
-    _run_mpnn = False       # will be set True when MPNN should proceed
+    _run_mpnn = False       # will be set True when MPNN stage should proceed
     _did_hallucinate = False  # True when a new trajectory was hallucinated+relaxed (normal mode)
     trajectory_beta = 0     # secondary structure fraction; computed in both modes
 
     ### -----------------------------------------------------------------------
-    ### FILTERING MODE: iterate over existing Trajectory/Relaxed PDBs
+    ### MPNN/FILTERING MODE: iterate over existing trajectories
     ### -----------------------------------------------------------------------
-    if args.steps == 'filtering':
+    if not run_hallucination:
         try:
-            trajectory_relaxed = next(_filtering_iter)
+            design_name, trajectory_pdb, trajectory_relaxed = next(_filtering_iter)
         except StopIteration:
             break
 
-        design_name = os.path.splitext(os.path.basename(trajectory_relaxed))[0]
         _lm = re.search(r'_l(\d+)_s(\d+)$', design_name)
         if not _lm:
             print(f"Could not parse length/seed from '{design_name}', skipping")
@@ -576,18 +698,15 @@ while True:
         length = int(_lm.group(1))
         seed = int(_lm.group(2))
         helicity_value = 0
-
-        # Prefer the unrelaxed trajectory PDB for MPNN template inputs; fall back to relaxed if removed
-        _traj_unrelaxed = os.path.join(design_paths["Trajectory"], design_name + ".pdb")
-        trajectory_pdb = _traj_unrelaxed if os.path.exists(_traj_unrelaxed) else trajectory_relaxed
         binder_chain = "B"
 
         # Compute secondary structure (needed for optimise_beta inside MPNN section)
         _, trajectory_beta, _, _, _, _, _, _ = calc_ss_percentage(trajectory_pdb, advanced_settings, binder_chain)
 
         # Compute interface residues (drives MPNN sequence design)
+        _trajectory_for_scoring = trajectory_relaxed if trajectory_relaxed and os.path.exists(trajectory_relaxed) else trajectory_pdb
         trajectory_interface_scores, trajectory_interface_AA, trajectory_interface_residues = score_interface(
-            trajectory_relaxed, binder_chain, use_pyrosetta=use_pyrosetta)
+            _trajectory_for_scoring, binder_chain, use_pyrosetta=use_pyrosetta)
 
         # Extract binder sequence from the existing PDB
         trajectory_sequence = _extract_binder_sequence(trajectory_pdb, binder_chain)
@@ -601,7 +720,7 @@ while True:
             continue
 
         design_start_time = time.time()
-        _run_mpnn = advanced_settings["enable_mpnn"]
+        _run_mpnn = run_filtering or (run_mpnn and advanced_settings["enable_mpnn"])
 
     ### -----------------------------------------------------------------------
     ### NORMAL HALLUCINATION MODE: generate new trajectories from scratch
@@ -698,7 +817,7 @@ while True:
                     continue
 
                 design_start_time = time.time()
-                _run_mpnn = advanced_settings["enable_mpnn"]
+                _run_mpnn = run_filtering or (run_mpnn and advanced_settings["enable_mpnn"])
                 _did_hallucinate = True
 
     ### -----------------------------------------------------------------------
@@ -710,41 +829,74 @@ while True:
         accepted_mpnn = 0
         mpnn_dict = {}
 
-        ### MPNN redesign of starting binder
-        mpnn_trajectories = mpnn_gen_sequence(trajectory_pdb, binder_chain, trajectory_interface_residues, advanced_settings)
-        
-        existing_mpnn_sequences = set()
-        if os.path.exists(mpnn_csv) and os.path.getsize(mpnn_csv) > 0:
-            try:
-                df_mpnn = pd.read_csv(mpnn_csv, usecols=['Sequence'])
-                if not df_mpnn.empty:
-                    existing_mpnn_sequences = set(df_mpnn['Sequence'].dropna().astype(str).values)
-            except pd.errors.EmptyDataError:
-                print(f"Warning: {mpnn_csv} is empty or has no columns. Starting with no existing MPNN sequences.")
-            except KeyError:
-                print(f"Warning: 'Sequence' column not found in {mpnn_csv}. Starting with no existing MPNN sequences.")
-            except Exception as e:
-                print(f"Warning: Could not read existing MPNN sequences from {mpnn_csv} due to: {e}. Starting with no existing MPNN sequences.")
+        sequence_entries = []
+        if run_mpnn:
+            ### MPNN redesign of starting binder
+            if args.reuse and _has_saved_sequences_for_design(design_name, design_paths):
+                sequence_entries = _load_sequences_for_design(design_name, design_paths)
+                print(f"Reuse mode: found {len(sequence_entries)} saved MPNN sequences for {design_name}, skipping sequence regeneration")
+            else:
+                mpnn_trajectories = mpnn_gen_sequence(trajectory_pdb, binder_chain, trajectory_interface_residues, advanced_settings)
+
+                existing_mpnn_sequences = set()
+                if args.reuse:
+                    if os.path.exists(mpnn_csv) and os.path.getsize(mpnn_csv) > 0:
+                        try:
+                            df_mpnn = pd.read_csv(mpnn_csv, usecols=['Sequence'])
+                            if not df_mpnn.empty:
+                                existing_mpnn_sequences = set(df_mpnn['Sequence'].dropna().astype(str).values)
+                        except pd.errors.EmptyDataError:
+                            print(f"Warning: {mpnn_csv} is empty or has no columns. Starting with no existing MPNN sequences.")
+                        except KeyError:
+                            print(f"Warning: 'Sequence' column not found in {mpnn_csv}. Starting with no existing MPNN sequences.")
+                        except Exception as e:
+                            print(f"Warning: Could not read existing MPNN sequences from {mpnn_csv} due to: {e}. Starting with no existing MPNN sequences.")
+                    else:
+                        print(f"Info: {mpnn_csv} does not exist or is empty. Starting with no existing MPNN sequences.")
+
+                # create set of MPNN sequences with allowed amino acid composition
+                restricted_AAs = set(aa.strip().upper() for aa in advanced_settings["omit_AAs"].split(',')) if advanced_settings["force_reject_AA"] else set()
+                mpnn_sequences = sorted({
+                    mpnn_trajectories['seq'][n][-length:]: {
+                        'seq': mpnn_trajectories['seq'][n][-length:],
+                        'score': mpnn_trajectories['score'][n],
+                        'seqid': mpnn_trajectories['seqid'][n]
+                    } for n in range(advanced_settings["num_seqs"])
+                    if (not restricted_AAs or not any(aa in mpnn_trajectories['seq'][n][-length:].upper() for aa in restricted_AAs))
+                    and mpnn_trajectories['seq'][n][-length:] not in existing_mpnn_sequences
+                }.values(), key=lambda x: x['score'])
+
+                del existing_mpnn_sequences
+
+                for _idx, _sequence in enumerate(mpnn_sequences, start=1):
+                    _design_name = f"{design_name}_mpnn{_idx}"
+                    sequence_entries.append({
+                        'design_name': _design_name,
+                        'seq': _sequence['seq'],
+                        'score': _sequence['score'],
+                        'seqid': _sequence['seqid']
+                    })
+
+                if sequence_entries and advanced_settings["save_mpnn_fasta"] is True:
+                    _save_sequences_for_design(design_name, sequence_entries, design_paths)
+                    for _entry in sequence_entries:
+                        save_fasta(_entry['design_name'], _entry['seq'], design_paths)
         else:
-            print(f"Info: {mpnn_csv} does not exist or is empty. Starting with no existing MPNN sequences.")
+            sequence_entries = _load_sequences_for_design(design_name, design_paths)
+            if not sequence_entries:
+                print(f"No saved MPNN sequences found for {design_name}; skipping filtering.")
 
-        # create set of MPNN sequences with allowed amino acid composition
-        restricted_AAs = set(aa.strip().upper() for aa in advanced_settings["omit_AAs"].split(',')) if advanced_settings["force_reject_AA"] else set()
+        # check whether any sequences are left after amino acid rejection and duplication check, and if yes proceed
+        if sequence_entries:
+            if not run_filtering:
+                print(f"Saved {len(sequence_entries)} MPNN sequences for {design_name}")
+                design_time = time.time() - design_start_time
+                design_time_text = f"{'%d hours, %d minutes, %d seconds' % (int(design_time // 3600), int((design_time % 3600) // 60), int(design_time % 60))}"
+                print("MPNN sequence generation for trajectory "+design_name+" took: "+design_time_text)
+                trajectory_n += 1
+                gc.collect()
+                continue
 
-        mpnn_sequences = sorted({
-            mpnn_trajectories['seq'][n][-length:]: {
-                'seq': mpnn_trajectories['seq'][n][-length:],
-                'score': mpnn_trajectories['score'][n],
-                'seqid': mpnn_trajectories['seqid'][n]
-            } for n in range(advanced_settings["num_seqs"])
-            if (not restricted_AAs or not any(aa in mpnn_trajectories['seq'][n][-length:].upper() for aa in restricted_AAs))
-            and mpnn_trajectories['seq'][n][-length:] not in existing_mpnn_sequences
-        }.values(), key=lambda x: x['score'])
-
-        del existing_mpnn_sequences
-  
-        # check whether any sequences are left after amino acid rejection and duplication check, and if yes proceed with prediction
-        if mpnn_sequences:
             # add optimisation for increasing recycles if trajectory is beta sheeted
             if advanced_settings["optimise_beta"] and float(trajectory_beta) > 15:
                 advanced_settings["num_recycles_validation"] = advanced_settings["optimise_beta_recycles_valid"]
@@ -770,21 +922,22 @@ while True:
                                                         data_dir=advanced_settings["af_params_dir"], use_multimer=multimer_validation)
             binder_prediction_model.prep_inputs(length=length)
 
-            # iterate over designed sequences        
-            for mpnn_sequence in mpnn_sequences:
+            # iterate over designed sequences
+            for mpnn_sequence in sequence_entries:
+                mpnn_design_name = mpnn_sequence.get('design_name') or (design_name + "_mpnn" + str(mpnn_n))
+                if args.reuse and run_filtering and mpnn_design_name in _processed_filtering_designs:
+                    print(f"Reuse mode: skipping existing filtering output for {mpnn_design_name}")
+                    mpnn_n += 1
+                    continue
+
                 mpnn_time = time.time()
 
                 # generate mpnn design name numbering
-                mpnn_design_name = design_name + "_mpnn" + str(mpnn_n)
-                mpnn_score = round(mpnn_sequence['score'],2)
-                mpnn_seqid = round(mpnn_sequence['seqid'],2)
+                mpnn_score = round(mpnn_sequence['score'],2) if mpnn_sequence.get('score') is not None else None
+                mpnn_seqid = round(mpnn_sequence['seqid'],2) if mpnn_sequence.get('seqid') is not None else None
 
                 # add design to dictionary
                 mpnn_dict[mpnn_design_name] = {'seq': mpnn_sequence['seq'], 'score': mpnn_score, 'seqid': mpnn_seqid}
-
-                # save fasta sequence
-                if advanced_settings["save_mpnn_fasta"] is True:
-                    save_fasta(mpnn_design_name, mpnn_sequence['seq'], design_paths)
 
                 # Define statistics_labels and model_numbers here so they're available
                 # for both early-failure partial rows and full-success rows
@@ -836,6 +989,7 @@ while True:
                     _elapsed_early = f"{'%d hours, %d minutes, %d seconds' % (int((time.time()-mpnn_time) // 3600), int(((time.time()-mpnn_time) % 3600) // 60), int((time.time()-mpnn_time) % 60))}"
                     _all_mpnn_row_early.extend([_elapsed_early, None, settings_file, filters_file, advanced_file, False, False])
                     insert_data(all_mpnn_full_stats_csv, _all_mpnn_row_early)
+                    _processed_filtering_designs.add(mpnn_design_name)
 
                     # Log to rejected_mpnn_full_stats.csv for early AF2 failures
                     rejected_data_list_for_csv = [mpnn_design_name, mpnn_sequence['seq']]
@@ -974,6 +1128,7 @@ while True:
 
                 # insert data into csv
                 insert_data(mpnn_csv, mpnn_data)
+                _processed_filtering_designs.add(mpnn_design_name)
 
                 plddt_values = {i: mpnn_data[i] for i in range(11, 15) if mpnn_data[i] is not None}
 
@@ -1004,8 +1159,9 @@ while True:
                     # copy animation from accepted trajectory
                     if advanced_settings["save_design_animations"]:
                         accepted_animation = os.path.join(design_paths["Accepted/Animation"], f"{design_name}.html")
-                        if not os.path.exists(accepted_animation):
-                            shutil.copy(os.path.join(design_paths["Trajectory/Animation"], f"{design_name}.html"), accepted_animation)
+                        source_animation = os.path.join(design_paths["Trajectory/Animation"], f"{design_name}.html")
+                        if not os.path.exists(accepted_animation) and os.path.exists(source_animation):
+                            shutil.copy(source_animation, accepted_animation)
 
                     # copy plots of accepted trajectory
                     plot_files = os.listdir(design_paths["Trajectory/Plots"])
@@ -1077,22 +1233,25 @@ while True:
                 print("")
 
         else:
-            print('Duplicate MPNN designs sampled with different trajectory, skipping current trajectory optimisation')
+            print('No MPNN sequences available for this trajectory, skipping')
             print("")
 
         # save space by removing unrelaxed design trajectory PDB
-        # (in filtering mode we never created it, so only remove in hallucination mode)
-        if args.steps != 'filtering' and advanced_settings["remove_unrelaxed_trajectory"]:
+        # (only remove trajectories created in this run)
+        if run_hallucination and advanced_settings["remove_unrelaxed_trajectory"]:
             if os.path.exists(trajectory_pdb) and trajectory_pdb != trajectory_relaxed:
                 os.remove(trajectory_pdb)
 
         # measure time it took to generate designs for one trajectory
         design_time = time.time() - design_start_time
         design_time_text = f"{'%d hours, %d minutes, %d seconds' % (int(design_time // 3600), int((design_time % 3600) // 60), int(design_time % 60))}"
-        print("Design and validation of trajectory "+design_name+" took: "+design_time_text)
+        if run_filtering:
+            print("Design and validation of trajectory "+design_name+" took: "+design_time_text)
+        else:
+            print("MPNN sequence generation of trajectory "+design_name+" took: "+design_time_text)
 
     # analyse the rejection rate of trajectories (hallucination mode only, after a full hallucination+MPNN cycle)
-    if _did_hallucinate:
+    if _did_hallucinate and run_filtering:
         if trajectory_n >= advanced_settings["start_monitoring"] and advanced_settings["enable_rejection_check"]:
             acceptance = accepted_designs / trajectory_n
             if not acceptance >= advanced_settings["acceptance_rate"]:
