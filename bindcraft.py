@@ -533,6 +533,9 @@ else:
 script_start_time = time.time()
 trajectory_n = 1
 accepted_designs = 0
+trajectory_runtime = TrajectoryDesignRuntime(advanced_settings) if selected_steps == ['hallucination'] else None
+mpnn_runtime = MPNNRuntime(advanced_settings) if selected_steps == ['mpnn'] else None
+validation_runtime = ValidationRuntime(advanced_settings, multimer_validation) if selected_steps == ['filtering'] else None
 
 def _extract_binder_sequence(pdb_path, chain_id):
     """Extract the amino-acid sequence of *chain_id* from a PDB file using Biopython."""
@@ -757,7 +760,8 @@ while True:
             ### Begin binder hallucination
             trajectory = binder_hallucination(design_name, target_settings["starting_pdb"], target_settings["chains"],
                                                 target_settings["target_hotspot_residues"], length, seed, helicity_value,
-                                                design_models, advanced_settings, design_paths, failure_csv)
+                                                design_models, advanced_settings, design_paths, failure_csv,
+                                                runtime=trajectory_runtime)
             trajectory_metrics = copy_dict(trajectory._tmp["best"]["aux"]["log"]) # contains plddt, ptm, i_ptm, pae, i_pae
             trajectory_pdb = os.path.join(design_paths["Trajectory"], design_name + ".pdb")
 
@@ -836,7 +840,9 @@ while True:
                 sequence_entries = _load_sequences_for_design(design_name, design_paths)
                 print(f"Reuse mode: found {len(sequence_entries)} saved MPNN sequences for {design_name}, skipping sequence regeneration")
             else:
-                mpnn_trajectories = mpnn_gen_sequence(trajectory_pdb, binder_chain, trajectory_interface_residues, advanced_settings)
+                mpnn_trajectories = mpnn_gen_sequence(trajectory_pdb, binder_chain, trajectory_interface_residues, advanced_settings, runtime=mpnn_runtime)
+                if trajectory_runtime is not None:
+                    trajectory_runtime.invalidate()
 
                 existing_mpnn_sequences = set()
                 if args.reuse:
@@ -902,25 +908,35 @@ while True:
                 advanced_settings["num_recycles_validation"] = advanced_settings["optimise_beta_recycles_valid"]
 
             ### Compile prediction models once for faster prediction of MPNN sequences
-            clear_mem()
             # compile complex prediction model
             validation_pdb = target_settings.get("filtering_pdb") if target_settings.get("filtering_pdb") else target_settings["starting_pdb"]
             validation_chains = target_settings.get("filtering_chains") if target_settings.get("filtering_chains") else target_settings["chains"]
-            
-            complex_prediction_model = mk_afdesign_model(protocol="binder", num_recycles=advanced_settings["num_recycles_validation"], data_dir=advanced_settings["af_params_dir"], 
-                                                        use_multimer=multimer_validation, use_initial_guess=advanced_settings["predict_initial_guess"], use_initial_atom_pos=advanced_settings["predict_bigbang"])
-            if advanced_settings["predict_initial_guess"] or advanced_settings["predict_bigbang"]:
-                complex_prediction_model.prep_inputs(pdb_filename=trajectory_pdb, chain='A', binder_chain='B', binder_len=length, use_binder_template=True, rm_target_seq=advanced_settings["rm_template_seq_predict"],
-                                                    rm_target_sc=advanced_settings["rm_template_sc_predict"], rm_template_ic=advanced_settings["remove_intra_chain_template"])
-            else:
-                complex_prediction_model.prep_inputs(pdb_filename=validation_pdb, chain=validation_chains, binder_len=length, rm_target_seq=advanced_settings["rm_template_seq_predict"],
-                                                    rm_target_sc=advanced_settings["rm_template_sc_predict"])
 
-            # compile binder monomer prediction model
-            binder_prediction_model = mk_afdesign_model(protocol="hallucination", use_templates=False, initial_guess=False, 
-                                                        use_initial_atom_pos=False, num_recycles=advanced_settings["num_recycles_validation"], 
-                                                        data_dir=advanced_settings["af_params_dir"], use_multimer=multimer_validation)
-            binder_prediction_model.prep_inputs(length=length)
+            if validation_runtime is not None:
+                complex_prediction_model, binder_prediction_model = validation_runtime.prepare_models(
+                    length=length,
+                    validation_pdb=validation_pdb,
+                    validation_chains=validation_chains,
+                    trajectory_pdb=trajectory_pdb,
+                )
+            else:
+                clear_mem()
+                if trajectory_runtime is not None:
+                    trajectory_runtime.invalidate()
+                complex_prediction_model = mk_afdesign_model(protocol="binder", num_recycles=advanced_settings["num_recycles_validation"], data_dir=advanced_settings["af_params_dir"], 
+                                                            use_multimer=multimer_validation, use_initial_guess=advanced_settings["predict_initial_guess"], use_initial_atom_pos=advanced_settings["predict_bigbang"])
+                if advanced_settings["predict_initial_guess"] or advanced_settings["predict_bigbang"]:
+                    complex_prediction_model.prep_inputs(pdb_filename=trajectory_pdb, chain='A', binder_chain='B', binder_len=length, use_binder_template=True, rm_target_seq=advanced_settings["rm_template_seq_predict"],
+                                                        rm_target_sc=advanced_settings["rm_template_sc_predict"], rm_template_ic=advanced_settings["remove_intra_chain_template"])
+                else:
+                    complex_prediction_model.prep_inputs(pdb_filename=validation_pdb, chain=validation_chains, binder_len=length, rm_target_seq=advanced_settings["rm_template_seq_predict"],
+                                                        rm_target_sc=advanced_settings["rm_template_sc_predict"])
+
+                # compile binder monomer prediction model
+                binder_prediction_model = mk_afdesign_model(protocol="hallucination", use_templates=False, initial_guess=False, 
+                                                            use_initial_atom_pos=False, num_recycles=advanced_settings["num_recycles_validation"], 
+                                                            data_dir=advanced_settings["af_params_dir"], use_multimer=multimer_validation)
+                binder_prediction_model.prep_inputs(length=length)
 
             # iterate over designed sequences
             for mpnn_sequence in sequence_entries:

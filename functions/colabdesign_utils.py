@@ -20,57 +20,261 @@ from .generic_utils import update_failures
 from .logging_utils import vprint
 from .ipsae_utils import calculate_ipsae
 
+_DEFAULT_TRAJECTORY_RUNTIME = None
+
+
+class TrajectoryDesignRuntime:
+    """Reusable AF2 trajectory runtime to avoid rebuilding the design model."""
+
+    def __init__(self, advanced_settings):
+        self.advanced_settings = advanced_settings
+        self.af_model = None
+        self._rg_loss_added = False
+        self._iptm_loss_added = False
+        self._termini_loss_added = False
+        self._helix_loss_added = False
+
+    def _ensure_model(self):
+        if self.af_model is not None:
+            return
+
+        t0 = time.time()
+        clear_mem()
+        self.af_model = mk_afdesign_model(
+            protocol="binder",
+            debug=False,
+            data_dir=self.advanced_settings["af_params_dir"],
+            use_multimer=self.advanced_settings["use_multimer_design"],
+            num_recycles=self.advanced_settings["num_recycles_design"],
+            best_metric='loss',
+        )
+        vprint(f"[AF2] Initialised reusable binder model in {time.time()-t0:.2f}s")
+
+    def invalidate(self):
+        """Force a rebuild after external clear_mem() calls."""
+        self.af_model = None
+        self._rg_loss_added = False
+        self._iptm_loss_added = False
+        self._termini_loss_added = False
+        self._helix_loss_added = False
+
+    def prepare_trajectory(self, starting_pdb, chain, target_hotspot_residues, length, seed, helicity_value):
+        self._ensure_model()
+
+        hotspot = None if target_hotspot_residues == "" else target_hotspot_residues
+
+        t_prep = time.time()
+        self.af_model.prep_inputs(
+            pdb_filename=starting_pdb,
+            chain=chain,
+            binder_len=length,
+            hotspot=hotspot,
+            seed=seed,
+            rm_aa=self.advanced_settings["omit_AAs"],
+            rm_target_seq=self.advanced_settings["rm_template_seq_design"],
+            rm_target_sc=self.advanced_settings["rm_template_sc_design"],
+        )
+        vprint(f"[AF2] Prepared inputs in {time.time()-t_prep:.2f}s")
+
+        # Reset recycles each run in case the prior trajectory changed them.
+        self.af_model.set_opt(num_recycles=self.advanced_settings["num_recycles_design"])
+
+        self.af_model.opt["weights"].update({
+            "pae": self.advanced_settings["weights_pae_intra"],
+            "plddt": self.advanced_settings["weights_plddt"],
+            "i_pae": self.advanced_settings["weights_pae_inter"],
+            "con": self.advanced_settings["weights_con_intra"],
+            "i_con": self.advanced_settings["weights_con_inter"],
+        })
+
+        self.af_model.opt["con"].update({
+            "num": self.advanced_settings["intra_contact_number"],
+            "cutoff": self.advanced_settings["intra_contact_distance"],
+            "binary": False,
+            "seqsep": 9,
+        })
+        self.af_model.opt["i_con"].update({
+            "num": self.advanced_settings["inter_contact_number"],
+            "cutoff": self.advanced_settings["inter_contact_distance"],
+            "binary": False,
+        })
+
+        if self.advanced_settings["use_rg_loss"]:
+            if not self._rg_loss_added:
+                add_rg_loss(self.af_model, self.advanced_settings["weights_rg"])
+                self._rg_loss_added = True
+            else:
+                self.af_model.opt["weights"]["rg"] = self.advanced_settings["weights_rg"]
+        elif self._rg_loss_added:
+            self.af_model.opt["weights"]["rg"] = 0.0
+
+        if self.advanced_settings["use_i_ptm_loss"]:
+            if not self._iptm_loss_added:
+                add_i_ptm_loss(self.af_model, self.advanced_settings["weights_iptm"])
+                self._iptm_loss_added = True
+            else:
+                self.af_model.opt["weights"]["i_ptm"] = self.advanced_settings["weights_iptm"]
+        elif self._iptm_loss_added:
+            self.af_model.opt["weights"]["i_ptm"] = 0.0
+
+        if self.advanced_settings["use_termini_distance_loss"]:
+            if not self._termini_loss_added:
+                add_termini_distance_loss(self.af_model, self.advanced_settings["weights_termini_loss"])
+                self._termini_loss_added = True
+            else:
+                self.af_model.opt["weights"]["NC"] = self.advanced_settings["weights_termini_loss"]
+        elif self._termini_loss_added:
+            self.af_model.opt["weights"]["NC"] = 0.0
+
+        if not self._helix_loss_added:
+            add_helix_loss(self.af_model, helicity_value)
+            self._helix_loss_added = True
+        else:
+            self.af_model.opt["weights"]["helix"] = helicity_value
+
+        return self.af_model
+
+
+class MPNNRuntime:
+    """Reusable MPNN runtime for sequence generation across trajectories."""
+
+    def __init__(self, advanced_settings):
+        self.advanced_settings = advanced_settings
+        self.mpnn_model = None
+
+    def _ensure_model(self):
+        if self.mpnn_model is not None:
+            return
+
+        t0 = time.time()
+        clear_mem()
+        self.mpnn_model = mk_mpnn_model(
+            backbone_noise=self.advanced_settings["backbone_noise"],
+            model_name=self.advanced_settings["model_path"],
+            weights=self.advanced_settings["mpnn_weights"],
+        )
+        vprint(f"[MPNN] Initialised reusable model in {time.time()-t0:.2f}s")
+
+    def invalidate(self):
+        self.mpnn_model = None
+
+    def sample_sequences(self, trajectory_pdb, binder_chain, trajectory_interface_residues):
+        self._ensure_model()
+
+        design_chains = 'A,' + binder_chain
+
+        if self.advanced_settings["mpnn_fix_interface"]:
+            fixed_positions = 'A,' + trajectory_interface_residues
+            fixed_positions = fixed_positions.rstrip(",")
+            print("Fixing interface residues: "+trajectory_interface_residues)
+        else:
+            fixed_positions = 'A'
+
+        self.mpnn_model.prep_inputs(
+            pdb_filename=trajectory_pdb,
+            chain=design_chains,
+            fix_pos=fixed_positions,
+            rm_aa=self.advanced_settings["omit_AAs"],
+        )
+
+        return self.mpnn_model.sample(
+            temperature=self.advanced_settings["sampling_temp"],
+            num=1,
+            batch=self.advanced_settings["num_seqs"],
+        )
+
+
+class ValidationRuntime:
+    """Reusable AF2 validation runtime for filtering-only runs."""
+
+    def __init__(self, advanced_settings, multimer_validation):
+        self.advanced_settings = advanced_settings
+        self.multimer_validation = multimer_validation
+        self.complex_prediction_model = None
+        self.binder_prediction_model = None
+        self._current_num_recycles = None
+
+    def _ensure_models(self):
+        num_recycles = self.advanced_settings["num_recycles_validation"]
+        if self.complex_prediction_model is None or self.binder_prediction_model is None:
+            t0 = time.time()
+            clear_mem()
+            self.complex_prediction_model = mk_afdesign_model(
+                protocol="binder",
+                num_recycles=num_recycles,
+                data_dir=self.advanced_settings["af_params_dir"],
+                use_multimer=self.multimer_validation,
+                use_initial_guess=self.advanced_settings["predict_initial_guess"],
+                use_initial_atom_pos=self.advanced_settings["predict_bigbang"],
+            )
+            self.binder_prediction_model = mk_afdesign_model(
+                protocol="hallucination",
+                use_templates=False,
+                initial_guess=False,
+                use_initial_atom_pos=False,
+                num_recycles=num_recycles,
+                data_dir=self.advanced_settings["af_params_dir"],
+                use_multimer=self.multimer_validation,
+            )
+            self._current_num_recycles = num_recycles
+            vprint(f"[AF2] Initialised reusable validation models in {time.time()-t0:.2f}s")
+            return
+
+        if self._current_num_recycles != num_recycles:
+            self.complex_prediction_model.set_opt(num_recycles=num_recycles)
+            self.binder_prediction_model.set_opt(num_recycles=num_recycles)
+            self._current_num_recycles = num_recycles
+
+    def invalidate(self):
+        self.complex_prediction_model = None
+        self.binder_prediction_model = None
+        self._current_num_recycles = None
+
+    def prepare_models(self, length, validation_pdb, validation_chains, trajectory_pdb):
+        self._ensure_models()
+
+        if self.advanced_settings["predict_initial_guess"] or self.advanced_settings["predict_bigbang"]:
+            self.complex_prediction_model.prep_inputs(
+                pdb_filename=trajectory_pdb,
+                chain='A',
+                binder_chain='B',
+                binder_len=length,
+                use_binder_template=True,
+                rm_target_seq=self.advanced_settings["rm_template_seq_predict"],
+                rm_target_sc=self.advanced_settings["rm_template_sc_predict"],
+                rm_template_ic=self.advanced_settings["remove_intra_chain_template"],
+            )
+        else:
+            self.complex_prediction_model.prep_inputs(
+                pdb_filename=validation_pdb,
+                chain=validation_chains,
+                binder_len=length,
+                rm_target_seq=self.advanced_settings["rm_template_seq_predict"],
+                rm_target_sc=self.advanced_settings["rm_template_sc_predict"],
+            )
+
+        self.binder_prediction_model.prep_inputs(length=length)
+        return self.complex_prediction_model, self.binder_prediction_model
+
 # hallucinate a binder
-def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residues, length, seed, helicity_value, design_models, advanced_settings, design_paths, failure_csv):
+def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residues, length, seed, helicity_value, design_models, advanced_settings, design_paths, failure_csv, runtime=None):
+    global _DEFAULT_TRAJECTORY_RUNTIME
+
     model_pdb_path = os.path.join(design_paths["Trajectory"], design_name+".pdb")
 
-    # clear GPU memory for new trajectory
-    t0 = time.time()
-    clear_mem()
+    if runtime is None:
+        if _DEFAULT_TRAJECTORY_RUNTIME is None:
+            _DEFAULT_TRAJECTORY_RUNTIME = TrajectoryDesignRuntime(advanced_settings)
+        runtime = _DEFAULT_TRAJECTORY_RUNTIME
 
-    # initialise binder hallucination model
-    af_model = mk_afdesign_model(protocol="binder", debug=False, data_dir=advanced_settings["af_params_dir"], 
-                                use_multimer=advanced_settings["use_multimer_design"], num_recycles=advanced_settings["num_recycles_design"],
-                                best_metric='loss')
-    vprint(f"[AF2] Initialised binder model in {time.time()-t0:.2f}s")
-
-    # sanity check for hotspots
-    if target_hotspot_residues == "":
-        target_hotspot_residues = None
-
-    t_prep = time.time()
-    af_model.prep_inputs(pdb_filename=starting_pdb, chain=chain, binder_len=length, hotspot=target_hotspot_residues, seed=seed, rm_aa=advanced_settings["omit_AAs"],
-                        rm_target_seq=advanced_settings["rm_template_seq_design"], rm_target_sc=advanced_settings["rm_template_sc_design"])
-    vprint(f"[AF2] Prepared inputs in {time.time()-t_prep:.2f}s")
-
-    ### Update weights based on specified settings
-    af_model.opt["weights"].update({"pae":advanced_settings["weights_pae_intra"],
-                                    "plddt":advanced_settings["weights_plddt"],
-                                    "i_pae":advanced_settings["weights_pae_inter"],
-                                    "con":advanced_settings["weights_con_intra"],
-                                    "i_con":advanced_settings["weights_con_inter"],
-                                    })
-
-    # redefine intramolecular contacts (con) and intermolecular contacts (i_con) definitions
-    af_model.opt["con"].update({"num":advanced_settings["intra_contact_number"],"cutoff":advanced_settings["intra_contact_distance"],"binary":False,"seqsep":9})
-    af_model.opt["i_con"].update({"num":advanced_settings["inter_contact_number"],"cutoff":advanced_settings["inter_contact_distance"],"binary":False})
-        
-
-    ### additional loss functions
-    if advanced_settings["use_rg_loss"]:
-        # radius of gyration loss
-        add_rg_loss(af_model, advanced_settings["weights_rg"])
-
-    if advanced_settings["use_i_ptm_loss"]:
-        # interface pTM loss
-        add_i_ptm_loss(af_model, advanced_settings["weights_iptm"])
-
-    if advanced_settings["use_termini_distance_loss"]:
-        # termini distance loss
-        add_termini_distance_loss(af_model, advanced_settings["weights_termini_loss"])
-
-    # add the helicity loss
-    add_helix_loss(af_model, helicity_value)
+    af_model = runtime.prepare_trajectory(
+        starting_pdb=starting_pdb,
+        chain=chain,
+        target_hotspot_residues=target_hotspot_residues,
+        length=length,
+        seed=seed,
+        helicity_value=helicity_value,
+    )
 
     # calculate the number of mutations to do based on the length of the protein
     greedy_tries = math.ceil(length * (advanced_settings["greedy_percentage"] / 100))
@@ -111,6 +315,8 @@ def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residu
         # if best iteration has high enough confidence then continue
         if initial_plddt > 0.65:
             print("Initial trajectory pLDDT good, continuing: "+str(initial_plddt))
+            soft_iterations = advanced_settings["soft_iterations"]
+            temporary_iterations = advanced_settings["temporary_iterations"]
             if advanced_settings["optimise_beta"]:
                 # temporarily dump model to assess secondary structure
                 af_model.save_pdb(model_pdb_path)
@@ -121,13 +327,13 @@ def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residu
 
                 # if beta sheeted trajectory is detected then choose to optimise
                 if float(beta) > 15:
-                    advanced_settings["soft_iterations"] = advanced_settings["soft_iterations"] + advanced_settings["optimise_beta_extra_soft"]
-                    advanced_settings["temporary_iterations"] = advanced_settings["temporary_iterations"] + advanced_settings["optimise_beta_extra_temp"]
+                    soft_iterations = soft_iterations + advanced_settings["optimise_beta_extra_soft"]
+                    temporary_iterations = temporary_iterations + advanced_settings["optimise_beta_extra_temp"]
                     af_model.set_opt(num_recycles=advanced_settings["optimise_beta_recycles_design"])
                     print("Beta sheeted trajectory detected, optimising settings")
 
             # how many logit iterations left
-            logits_iter = advanced_settings["soft_iterations"] - 50
+            logits_iter = soft_iterations - 50
             if logits_iter > 0:
                 print("Stage 1: Additional Logits Optimisation")
                 af_model.clear_best()
@@ -142,11 +348,11 @@ def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residu
                 logit_plddt = initial_plddt
 
             # perform softmax trajectory design
-            if advanced_settings["temporary_iterations"] > 0:
+            if temporary_iterations > 0:
                 print("Stage 2: Softmax Optimisation")
                 af_model.clear_best()
                 t_soft = time.time()
-                af_model.design_soft(advanced_settings["temporary_iterations"], e_temp=1e-2, models=design_models, num_models=1,
+                af_model.design_soft(temporary_iterations, e_temp=1e-2, models=design_models, num_models=1,
                                     sample_models=advanced_settings["sample_models"], ramp_recycles=False, save_best=True)
                 vprint(f"[AF2] Softmax stage in {time.time()-t_soft:.2f}s")
                 softmax_plddt = get_best_plddt(af_model, length)
@@ -385,7 +591,10 @@ def predict_binder_alone(prediction_model, binder_sequence, mpnn_design_name, le
     return binder_stats
 
 # run MPNN to generate sequences for binders
-def mpnn_gen_sequence(trajectory_pdb, binder_chain, trajectory_interface_residues, advanced_settings):
+def mpnn_gen_sequence(trajectory_pdb, binder_chain, trajectory_interface_residues, advanced_settings, runtime=None):
+    if runtime is not None:
+        return runtime.sample_sequences(trajectory_pdb, binder_chain, trajectory_interface_residues)
+
     # clear GPU memory
     clear_mem()
 
